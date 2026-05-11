@@ -1,0 +1,9 @@
+*.db
+*.db-shm
+*.db-wal
+__pycache__/
+*.pyc
+.env
+.DS_Store
+node_modules/
+*.zip

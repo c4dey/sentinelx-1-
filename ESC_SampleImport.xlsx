@@ -1,0 +1,81 @@
+/* colors, fonts, spacing — lahat ng global vars nandito */
+
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
+:root {
+  /* background layers */
+  --bg:       #09070f;
+  --bg2:      #100e18;
+  --bg3:      #17141f;
+  --bg4:      #1e1a2a;
+
+  /* borders */
+  --border:   #221e30;
+  --border2:  #2e2840;
+
+  /* text */
+  --text:     #ede8f8;
+  --text2:    #8a80a8;
+  --text3:    #4a4268;
+
+  /* accent / brand */
+  --accent:        #b06aff;
+  --accent2:       #7c3aed;
+  --accent-glow:   rgba(176,106,255,0.18);
+
+  /* severity colors */
+  --critical:       #f43f7a;
+  --critical-bg:    rgba(244,63,122,0.08);
+  --critical-glow:  rgba(244,63,122,0.25);
+
+  --high:           #f97316;
+  --high-bg:        rgba(249,115,22,0.08);
+  --high-glow:      rgba(249,115,22,0.22);
+
+  --medium:         #a78bfa;
+  --medium-bg:      rgba(167,139,250,0.08);
+  --medium-glow:    rgba(167,139,250,0.22);
+
+  --low:            #34d399;
+  --low-bg:         rgba(52,211,153,0.08);
+  --low-glow:       rgba(52,211,153,0.22);
+
+  --updated:        #34d399;
+  --updated-bg:     rgba(52,211,153,0.08);
+  --green:          #34d399;
+
+  --yellow:         #facc50;
+  --yellow-bg:      rgba(250,204,80,0.08);
+  --yellow-glow:    rgba(250,204,80,0.22);
+
+  /* fonts */
+  --mono:    'IBM Plex Mono', monospace;
+  --sans:    'IBM Plex Sans', sans-serif;
+  --display: 'Space Grotesk', sans-serif;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  min-height: 100vh;
+  /* subtle grid overlay sa background */
+  background-image:
+    linear-gradient(rgba(176,106,255,0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(176,106,255,0.025) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
+/* scrollbar styling para hindi pangit yung default */
+::-webkit-scrollbar        { width: 5px; height: 5px; }
+::-webkit-scrollbar-track  { background: var(--bg); }
+::-webkit-scrollbar-thumb  { background: var(--border2); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text3); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 6px rgba(52,211,153,0.7); }
+  50%       { opacity: .5; box-shadow: 0 0 12px rgba(52,211,153,0.3); }
+}

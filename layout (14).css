@@ -1,0 +1,585 @@
+'use strict';
+// ═══════════════════════════════════════════════════════════════
+//  SentinelX — Report Comparison Engine
+//  Handles both VM (Vulnerability Management) and
+//  ESC (Endpoint Sensor Compliance) diff logic
+// ═══════════════════════════════════════════════════════════════
+
+// ── Shared helpers ────────────────────────────────────────────
+const SEV_RANK = { Critical: 4, High: 3, Medium: 2, Low: 1 };
+
+function cmpFmtPeriod(p) {
+  if (!p) return '—';
+  const m = p.match(/^(\d{4})-(\d{2})$/);
+  if (m) {
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return `${months[parseInt(m[2])-1]} ${m[1]}`;
+  }
+  return p;
+}
+
+function deltaArrow(val, positive = true) {
+  if (val === 0) return `<span class="delta-zero">→ 0</span>`;
+  const up   = val > 0;
+  const good = positive ? up : !up;
+  return `<span class="delta-${good ? 'good' : 'bad'}">${up ? '↑' : '↓'} ${Math.abs(val)}</span>`;
+}
+function pctDelta(val) {
+  if (val === 0) return `<span class="delta-zero">→ 0%</span>`;
+  const up = val > 0;
+  return `<span class="delta-${up ? 'good' : 'bad'}">${up ? '↑' : '↓'} ${Math.abs(val)}%</span>`;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  VM COMPARISON
+// ══════════════════════════════════════════════════════════════
+
+let vmCmpPeriodA = null; // previous (older)
+let vmCmpPeriodB = null; // current  (newer)
+
+function vmGetAllPeriods() {
+  return [...new Set(vmData.map(r => r.period).filter(Boolean))].sort().reverse();
+}
+
+function vmOpenCompare() {
+  vmSwitchTab('compare', document.getElementById('vm-tab-btn-compare'));
+}
+
+function vmRenderCompareTab() {
+  const periods = vmGetAllPeriods();
+
+  // Auto-select two most recent periods
+  if (!vmCmpPeriodB) vmCmpPeriodB = periods[0] || null;
+  if (!vmCmpPeriodA) vmCmpPeriodA = periods[1] || null;
+
+  // Populate selectors
+  const selA = document.getElementById('vm-cmp-sel-a');
+  const selB = document.getElementById('vm-cmp-sel-b');
+  if (!selA || !selB) return;
+
+  const opts = periods.map(p =>
+    `<option value="${p}">${cmpFmtPeriod(p)}</option>`
+  ).join('');
+  selA.innerHTML = opts;
+  selB.innerHTML = opts;
+  if (vmCmpPeriodA) selA.value = vmCmpPeriodA;
+  if (vmCmpPeriodB) selB.value = vmCmpPeriodB;
+
+  vmRunCompare();
+}
+
+function vmRunCompare() {
+  vmCmpPeriodA = document.getElementById('vm-cmp-sel-a')?.value || null;
+  vmCmpPeriodB = document.getElementById('vm-cmp-sel-b')?.value || null;
+
+  const container = document.getElementById('vm-cmp-results');
+  if (!container) return;
+
+  if (!vmCmpPeriodA || !vmCmpPeriodB) {
+    container.innerHTML = `<div class="cmp-empty">Select two periods to compare.</div>`;
+    return;
+  }
+  if (vmCmpPeriodA === vmCmpPeriodB) {
+    container.innerHTML = `<div class="cmp-empty">Select two <em>different</em> periods to compare.</div>`;
+    return;
+  }
+
+  // Ensure A is older, B is newer
+  const [pOld, pNew] = vmCmpPeriodA < vmCmpPeriodB
+    ? [vmCmpPeriodA, vmCmpPeriodB]
+    : [vmCmpPeriodB, vmCmpPeriodA];
+
+  const recOld = vmData.filter(r => r.period === pOld);
+  const recNew = vmData.filter(r => r.period === pNew);
+
+  if (!recOld.length && !recNew.length) {
+    container.innerHTML = `<div class="cmp-empty">No data found for either period.</div>`;
+    return;
+  }
+
+  // Build lookup maps keyed by CVSS-ID + Asset
+  const keyOf = r => `${r.id}::${r.asset}`;
+  const mapOld = new Map(recOld.map(r => [keyOf(r), r]));
+  const mapNew = new Map(recNew.map(r => [keyOf(r), r]));
+
+  const allKeys = new Set([...mapOld.keys(), ...mapNew.keys()]);
+
+  const changes = {
+    new:        [],   // appeared in new, not in old
+    resolved:   [],   // status flipped to Resolved in new
+    reopened:   [],   // was Resolved in old, now Open/In Progress
+    worsened:   [],   // severity went UP
+    improved:   [],   // severity went DOWN
+    statusOnly: [],   // only status changed (not severity)
+    unchanged:  [],   // identical in both
+    removed:    [],   // in old only (period rotation / deletion)
+  };
+
+  allKeys.forEach(k => {
+    const o = mapOld.get(k);
+    const n = mapNew.get(k);
+
+    if (!o) { changes.new.push(n); return; }
+    if (!n) { changes.removed.push(o); return; }
+
+    const sevOld = SEV_RANK[o.severity] || 0;
+    const sevNew = SEV_RANK[n.severity] || 0;
+
+    if (n.status === 'Resolved' && o.status !== 'Resolved') {
+      changes.resolved.push({ old: o, new: n }); return;
+    }
+    if (o.status === 'Resolved' && n.status !== 'Resolved') {
+      changes.reopened.push({ old: o, new: n }); return;
+    }
+    if (sevNew > sevOld) { changes.worsened.push({ old: o, new: n }); return; }
+    if (sevNew < sevOld) { changes.improved.push({ old: o, new: n }); return; }
+    if (o.status !== n.status) { changes.statusOnly.push({ old: o, new: n }); return; }
+    changes.unchanged.push(n);
+  });
+
+  // ── Summary bar ───────────────────────────────────────────
+  const totalOld = recOld.length;
+  const totalNew = recNew.length;
+  const critOld  = recOld.filter(r => r.severity === 'Critical').length;
+  const critNew  = recNew.filter(r => r.severity === 'Critical').length;
+  const resolvedOld = recOld.filter(r => r.status === 'Resolved').length;
+  const resolvedNew = recNew.filter(r => r.status === 'Resolved').length;
+
+  let html = `
+    <div class="cmp-header-strip">
+      <div class="cmp-period-badge old">${cmpFmtPeriod(pOld)} <span class="cmp-badge-sub">Previous</span></div>
+      <div class="cmp-arrow-center">
+        <svg width="28" height="14" viewBox="0 0 28 14" fill="none">
+          <path d="M0 7h24M19 2l5 5-5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <div class="cmp-period-badge new">${cmpFmtPeriod(pNew)} <span class="cmp-badge-sub">Current</span></div>
+    </div>
+
+    <div class="cmp-scorecard-grid">
+      <div class="cmp-scorecard">
+        <div class="cmp-scorecard-label">Total Vulns</div>
+        <div class="cmp-scorecard-values">
+          <span class="cmp-val-old">${totalOld}</span>
+          <span class="cmp-val-arrow">→</span>
+          <span class="cmp-val-new">${totalNew}</span>
+        </div>
+        <div class="cmp-scorecard-delta">${deltaArrow(totalNew - totalOld, false)}</div>
+      </div>
+      <div class="cmp-scorecard">
+        <div class="cmp-scorecard-label">Critical</div>
+        <div class="cmp-scorecard-values">
+          <span class="cmp-val-old" style="color:var(--critical)">${critOld}</span>
+          <span class="cmp-val-arrow">→</span>
+          <span class="cmp-val-new" style="color:var(--critical)">${critNew}</span>
+        </div>
+        <div class="cmp-scorecard-delta">${deltaArrow(critNew - critOld, false)}</div>
+      </div>
+      <div class="cmp-scorecard">
+        <div class="cmp-scorecard-label">Resolved</div>
+        <div class="cmp-scorecard-values">
+          <span class="cmp-val-old" style="color:var(--green)">${resolvedOld}</span>
+          <span class="cmp-val-arrow">→</span>
+          <span class="cmp-val-new" style="color:var(--green)">${resolvedNew}</span>
+        </div>
+        <div class="cmp-scorecard-delta">${deltaArrow(resolvedNew - resolvedOld, true)}</div>
+      </div>
+      <div class="cmp-scorecard">
+        <div class="cmp-scorecard-label">New This Period</div>
+        <div class="cmp-scorecard-values">
+          <span class="cmp-val-new" style="color:var(--yellow);font-size:22px">${changes.new.length}</span>
+        </div>
+        <div class="cmp-scorecard-delta" style="color:var(--text3);font-size:10px">newly added</div>
+      </div>
+      <div class="cmp-scorecard">
+        <div class="cmp-scorecard-label">Newly Resolved</div>
+        <div class="cmp-scorecard-values">
+          <span class="cmp-val-new" style="color:var(--green);font-size:22px">${changes.resolved.length}</span>
+        </div>
+        <div class="cmp-scorecard-delta" style="color:var(--text3);font-size:10px">fixed ✓</div>
+      </div>
+      <div class="cmp-scorecard">
+        <div class="cmp-scorecard-label">Worsened</div>
+        <div class="cmp-scorecard-values">
+          <span class="cmp-val-new" style="color:var(--critical);font-size:22px">${changes.worsened.length}</span>
+        </div>
+        <div class="cmp-scorecard-delta" style="color:var(--text3);font-size:10px">severity ↑</div>
+      </div>
+    </div>`;
+
+  // ── Change sections ────────────────────────────────────────
+  const SEV_COLOR = { Critical:'var(--critical)', High:'var(--orange)', Medium:'var(--yellow)', Low:'var(--green)' };
+
+  function vmCmpRow(r, type, pair) {
+    const isNew = type === 'new', isRemoved = type === 'removed';
+    const rec   = pair ? pair.new : r;
+    const old   = pair ? pair.old : null;
+    const typeLabels = {
+      new:        ['cmp-tag-new',      '+ New'],
+      resolved:   ['cmp-tag-resolved', '✓ Resolved'],
+      reopened:   ['cmp-tag-reopened', '⚠ Reopened'],
+      worsened:   ['cmp-tag-worsened', '↑ Worsened'],
+      improved:   ['cmp-tag-improved', '↓ Improved'],
+      statusOnly: ['cmp-tag-status',   '~ Status'],
+      unchanged:  ['cmp-tag-unchanged','= Unchanged'],
+      removed:    ['cmp-tag-removed',  '− Removed'],
+    };
+    const [tagClass, tagLabel] = typeLabels[type] || ['',''];
+    const showSevChange = old && old.severity !== rec.severity;
+    const showStatChange = old && old.status !== rec.status;
+
+    return `
+      <tr class="cmp-row cmp-row-${type}">
+        <td><span class="cmp-tag ${tagClass}">${tagLabel}</span></td>
+        <td style="font-family:var(--mono);font-size:11px;color:var(--text2)">${rec.id || '—'}</td>
+        <td style="font-size:12px;max-width:220px">${rec.name || rec.comment || '—'}</td>
+        <td style="font-family:var(--mono);font-size:11px">${rec.asset}</td>
+        <td>${showSevChange
+          ? `<span style="color:${SEV_COLOR[old.severity]};text-decoration:line-through;font-size:11px">${old.severity}</span>
+             <span style="margin:0 4px;color:var(--text3)">→</span>
+             <span style="color:${SEV_COLOR[rec.severity]};font-size:11px;font-weight:600">${rec.severity}</span>`
+          : `<span style="color:${SEV_COLOR[rec.severity]};font-size:11px">${rec.severity}</span>`
+        }</td>
+        <td>${showStatChange
+          ? `<span style="color:var(--text3);text-decoration:line-through;font-size:11px">${old.status}</span>
+             <span style="margin:0 4px;color:var(--text3)">→</span>
+             <span style="font-size:11px;font-weight:600">${rec.status}</span>`
+          : `<span style="font-size:11px">${rec.status}</span>`
+        }</td>
+        <td style="font-family:var(--mono);font-size:10px;color:var(--text3)">${rec.ticket || '—'}</td>
+      </tr>`;
+  }
+
+  function vmCmpSection(title, icon, colorVar, items, type, isPair) {
+    if (!items.length) return '';
+    return `
+      <div class="cmp-section">
+        <div class="cmp-section-header" style="--sec-color:${colorVar}">
+          <span class="cmp-section-icon">${icon}</span>
+          <span class="cmp-section-title">${title}</span>
+          <span class="cmp-section-count">${items.length}</span>
+        </div>
+        <div class="table-wrap">
+          <table class="cmp-table">
+            <thead><tr>
+              <th>Type</th><th>CVE ID</th><th>Vulnerability</th>
+              <th>Asset</th><th>Severity</th><th>Status</th><th>Ticket</th>
+            </tr></thead>
+            <tbody>
+              ${items.map(item => vmCmpRow(isPair ? null : item, type, isPair ? item : null)).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>`;
+  }
+
+  html += vmCmpSection('New Vulnerabilities',       '🆕', 'var(--yellow)',   changes.new,        'new',        false);
+  html += vmCmpSection('Worsened',                  '🔴', 'var(--critical)', changes.worsened,   'worsened',   true);
+  html += vmCmpSection('Reopened',                  '⚠️', 'var(--orange)',   changes.reopened,   'reopened',   true);
+  html += vmCmpSection('Newly Resolved',            '✅', 'var(--green)',    changes.resolved,   'resolved',   true);
+  html += vmCmpSection('Improved Severity',         '📉', 'var(--low)',      changes.improved,   'improved',   true);
+  html += vmCmpSection('Status Changed',            '🔄', 'var(--accent)',   changes.statusOnly, 'statusOnly', true);
+  html += vmCmpSection('Removed from Period',       '➖', 'var(--text3)',    changes.removed,    'removed',    false);
+
+  if (changes.unchanged.length) {
+    html += `
+      <div class="cmp-section cmp-section-collapsed">
+        <div class="cmp-section-header" style="--sec-color:var(--text3)" onclick="this.parentElement.classList.toggle('cmp-section-collapsed')">
+          <span class="cmp-section-icon">═</span>
+          <span class="cmp-section-title">Unchanged</span>
+          <span class="cmp-section-count">${changes.unchanged.length}</span>
+          <span class="cmp-expand-hint">click to expand</span>
+        </div>
+        <div class="table-wrap">
+          <table class="cmp-table">
+            <thead><tr><th>Type</th><th>CVE ID</th><th>Vulnerability</th><th>Asset</th><th>Severity</th><th>Status</th><th>Ticket</th></tr></thead>
+            <tbody>${changes.unchanged.map(r => vmCmpRow(r, 'unchanged', null)).join('')}</tbody>
+          </table>
+        </div>
+      </div>`;
+  }
+
+  if ([...Object.values(changes)].every(a => !a.length)) {
+    html += `<div class="cmp-empty">No data available for one or both periods.</div>`;
+  }
+
+  container.innerHTML = html;
+}
+
+
+// ══════════════════════════════════════════════════════════════
+//  ESC COMPARISON
+// ══════════════════════════════════════════════════════════════
+
+let escCmpPeriodA = null;
+let escCmpPeriodB = null;
+
+function escGetAllPeriods() {
+  return [...new Set(escRecords.map(r => r.date.slice(0,7)).filter(Boolean))].sort().reverse();
+}
+
+function escOpenCompare() {
+  escSwitchTabById('compare');
+}
+
+function escRenderCompareTab() {
+  const periods = escGetAllPeriods();
+
+  if (!escCmpPeriodB) escCmpPeriodB = periods[0] || null;
+  if (!escCmpPeriodA) escCmpPeriodA = periods[1] || null;
+
+  const selA = document.getElementById('esc-cmp-sel-a');
+  const selB = document.getElementById('esc-cmp-sel-b');
+  if (!selA || !selB) return;
+
+  const opts = periods.map(p => {
+    const label = new Date(p+'-01').toLocaleDateString('en-US',{year:'numeric',month:'long'});
+    return `<option value="${p}">${label}</option>`;
+  }).join('');
+  selA.innerHTML = opts;
+  selB.innerHTML = opts;
+  if (escCmpPeriodA) selA.value = escCmpPeriodA;
+  if (escCmpPeriodB) selB.value = escCmpPeriodB;
+
+  escRunCompare();
+}
+
+function escRunCompare() {
+  escCmpPeriodA = document.getElementById('esc-cmp-sel-a')?.value || null;
+  escCmpPeriodB = document.getElementById('esc-cmp-sel-b')?.value || null;
+
+  const container = document.getElementById('esc-cmp-results');
+  if (!container) return;
+
+  if (!escCmpPeriodA || !escCmpPeriodB) {
+    container.innerHTML = `<div class="cmp-empty">Select two periods to compare.</div>`; return;
+  }
+  if (escCmpPeriodA === escCmpPeriodB) {
+    container.innerHTML = `<div class="cmp-empty">Select two <em>different</em> periods to compare.</div>`; return;
+  }
+
+  const [pOld, pNew] = escCmpPeriodA < escCmpPeriodB
+    ? [escCmpPeriodA, escCmpPeriodB]
+    : [escCmpPeriodB, escCmpPeriodA];
+
+  // For each asset + period, pick the latest record within that period
+  function latestPerAsset(period) {
+    const map = new Map();
+    escRecords
+      .filter(r => r.date.slice(0,7) === period)
+      .sort((a,b) => a.date.localeCompare(b.date))
+      .forEach(r => map.set(r.asset, r));
+    return map;
+  }
+
+  const mapOld = latestPerAsset(pOld);
+  const mapNew = latestPerAsset(pNew);
+  const allAssets = [...new Set([...mapOld.keys(), ...mapNew.keys()])].sort();
+
+  if (!mapOld.size && !mapNew.size) {
+    container.innerHTML = `<div class="cmp-empty">No records found for either period.</div>`; return;
+  }
+
+  // ── Global totals delta ────────────────────────────────────
+  const sumOld = [...mapOld.values()].reduce((a,r) => ({
+    ep: a.ep + r.totalEP, srv: a.srv + r.totalSrv,
+    uEP: a.uEP + r.updatedEP, uSrv: a.uSrv + r.updatedSrv,
+  }), {ep:0,srv:0,uEP:0,uSrv:0});
+
+  const sumNew = [...mapNew.values()].reduce((a,r) => ({
+    ep: a.ep + r.totalEP, srv: a.srv + r.totalSrv,
+    uEP: a.uEP + r.updatedEP, uSrv: a.uSrv + r.updatedSrv,
+  }), {ep:0,srv:0,uEP:0,uSrv:0});
+
+  const pctOld = Math.round((sumOld.uEP + sumOld.uSrv) / (sumOld.ep + sumOld.srv || 1) * 100);
+  const pctNew = Math.round((sumNew.uEP + sumNew.uSrv) / (sumNew.ep + sumNew.srv || 1) * 100);
+
+  const fmtPeriod = p => new Date(p+'-01').toLocaleDateString('en-US',{year:'numeric',month:'long'});
+
+  // ── Asset-level diff ───────────────────────────────────────
+  const assetDiffs = allAssets.map(asset => {
+    const o = mapOld.get(asset);
+    const n = mapNew.get(asset);
+
+    if (!o) return { asset, type:'new',     new:n,   old:null };
+    if (!n) return { asset, type:'removed', new:null, old:o   };
+
+    const epDelta  = n.epPct  - o.epPct;
+    const srvDelta = n.srvPct - o.srvPct;
+    const nowCompliant = n.epPct === 100 && n.srvPct === 100;
+    const wasCompliant = o.epPct === 100 && o.srvPct === 100;
+
+    let type = 'unchanged';
+    if (!wasCompliant && nowCompliant)                                    type = 'achieved';
+    else if (wasCompliant && !nowCompliant)                               type = 'regressed';
+    else if (epDelta > 0 || srvDelta > 0)                                type = 'improved';
+    else if (epDelta < 0 || srvDelta < 0)                                type = 'worsened';
+
+    return { asset, type, new:n, old:o, epDelta, srvDelta };
+  });
+
+  // Sort: worsened/regressed first, then improved/achieved, then unchanged
+  const typeOrder = { regressed:0, worsened:1, removed:2, improved:3, achieved:4, new:5, unchanged:6 };
+  assetDiffs.sort((a,b) => (typeOrder[a.type]||99) - (typeOrder[b.type]||99));
+
+  // ── Headline scorecard ─────────────────────────────────────
+  const achieved  = assetDiffs.filter(d => d.type === 'achieved').length;
+  const regressed = assetDiffs.filter(d => d.type === 'regressed').length;
+  const improved  = assetDiffs.filter(d => d.type === 'improved').length;
+  const worsened  = assetDiffs.filter(d => d.type === 'worsened').length;
+  const added     = assetDiffs.filter(d => d.type === 'new').length;
+
+  let html = `
+    <div class="cmp-header-strip">
+      <div class="cmp-period-badge old">${fmtPeriod(pOld)} <span class="cmp-badge-sub">Previous</span></div>
+      <div class="cmp-arrow-center">
+        <svg width="28" height="14" viewBox="0 0 28 14" fill="none">
+          <path d="M0 7h24M19 2l5 5-5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <div class="cmp-period-badge new">${fmtPeriod(pNew)} <span class="cmp-badge-sub">Current</span></div>
+    </div>
+
+    <div class="cmp-scorecard-grid">
+      <div class="cmp-scorecard">
+        <div class="cmp-scorecard-label">Overall Compliance</div>
+        <div class="cmp-scorecard-values">
+          <span class="cmp-val-old">${pctOld}%</span>
+          <span class="cmp-val-arrow">→</span>
+          <span class="cmp-val-new" style="color:${pctNew >= pctOld ? 'var(--green)' : 'var(--critical)'}">${pctNew}%</span>
+        </div>
+        <div class="cmp-scorecard-delta">${pctDelta(pctNew - pctOld)}</div>
+      </div>
+      <div class="cmp-scorecard">
+        <div class="cmp-scorecard-label">Total Endpoints</div>
+        <div class="cmp-scorecard-values">
+          <span class="cmp-val-old">${sumOld.ep}</span>
+          <span class="cmp-val-arrow">→</span>
+          <span class="cmp-val-new">${sumNew.ep}</span>
+        </div>
+        <div class="cmp-scorecard-delta">${deltaArrow(sumNew.ep - sumOld.ep, true)}</div>
+      </div>
+      <div class="cmp-scorecard">
+        <div class="cmp-scorecard-label">Updated Endpoints</div>
+        <div class="cmp-scorecard-values">
+          <span class="cmp-val-old">${sumOld.uEP}</span>
+          <span class="cmp-val-arrow">→</span>
+          <span class="cmp-val-new">${sumNew.uEP}</span>
+        </div>
+        <div class="cmp-scorecard-delta">${deltaArrow(sumNew.uEP - sumOld.uEP, true)}</div>
+      </div>
+      <div class="cmp-scorecard">
+        <div class="cmp-scorecard-label">Fully Compliant</div>
+        <div class="cmp-scorecard-values">
+          <span class="cmp-val-new" style="color:var(--green);font-size:22px">${achieved}</span>
+        </div>
+        <div class="cmp-scorecard-delta" style="color:var(--text3);font-size:10px">assets ✓</div>
+      </div>
+      <div class="cmp-scorecard">
+        <div class="cmp-scorecard-label">Improved</div>
+        <div class="cmp-scorecard-values">
+          <span class="cmp-val-new" style="color:var(--low);font-size:22px">${improved + achieved}</span>
+        </div>
+        <div class="cmp-scorecard-delta" style="color:var(--text3);font-size:10px">assets ↑</div>
+      </div>
+      <div class="cmp-scorecard">
+        <div class="cmp-scorecard-label">Regressed</div>
+        <div class="cmp-scorecard-values">
+          <span class="cmp-val-new" style="color:var(--critical);font-size:22px">${worsened + regressed}</span>
+        </div>
+        <div class="cmp-scorecard-delta" style="color:var(--text3);font-size:10px">assets ↓</div>
+      </div>
+    </div>
+
+    <div class="cmp-asset-grid">`;
+
+  const typeConfig = {
+    regressed:  { label:'Compliance Lost',  icon:'🔴', cls:'regressed'  },
+    worsened:   { label:'Declined',          icon:'📉', cls:'worsened'   },
+    removed:    { label:'Asset Removed',     icon:'➖', cls:'removed'    },
+    improved:   { label:'Improved',          icon:'📈', cls:'improved'   },
+    achieved:   { label:'Now Compliant',     icon:'✅', cls:'achieved'   },
+    new:        { label:'New Asset',         icon:'🆕', cls:'new'        },
+    unchanged:  { label:'No Change',         icon:'═',  cls:'unchanged'  },
+  };
+
+  assetDiffs.forEach(d => {
+    const cfg  = typeConfig[d.type] || typeConfig.unchanged;
+    const rec  = d.new || d.old;
+    const old  = d.old;
+
+    const epBar  = rec ? Math.min(100, rec.epPct)  : 0;
+    const srvBar = rec ? Math.min(100, rec.srvPct) : 0;
+    const epColor  = epBar  >= 100 ? 'var(--green)' : epBar  >= 80 ? 'var(--low)' : epBar  >= 50 ? 'var(--orange)' : 'var(--critical)';
+    const srvColor = srvBar >= 100 ? 'var(--green)' : srvBar >= 80 ? 'var(--low)' : srvBar >= 50 ? 'var(--orange)' : 'var(--critical)';
+
+    html += `
+      <div class="cmp-asset-card cmp-asset-${cfg.cls}">
+        <div class="cmp-asset-card-top">
+          <div>
+            <div class="cmp-asset-name">${d.asset}</div>
+            <div class="cmp-asset-date">${rec ? rec.date : '—'}</div>
+          </div>
+          <span class="cmp-tag cmp-tag-${cfg.cls}">${cfg.icon} ${cfg.label}</span>
+        </div>`;
+
+    if (d.type === 'removed') {
+      html += `<div style="font-family:var(--mono);font-size:10px;color:var(--text3);padding:8px 0">Not present in ${fmtPeriod(pNew)}</div>`;
+    } else if (d.type === 'new') {
+      html += `
+        <div class="cmp-bar-row">
+          <span class="cmp-bar-label">EP</span>
+          <div class="cmp-bar-track"><div class="cmp-bar-fill" style="width:${epBar}%;background:${epColor}"></div></div>
+          <span class="cmp-bar-val" style="color:${epColor}">${rec.epPct}%</span>
+          <span class="cmp-bar-counts">${rec.updatedEP}/${rec.totalEP}</span>
+        </div>
+        <div class="cmp-bar-row">
+          <span class="cmp-bar-label">SRV</span>
+          <div class="cmp-bar-track"><div class="cmp-bar-fill" style="width:${srvBar}%;background:${srvColor}"></div></div>
+          <span class="cmp-bar-val" style="color:${srvColor}">${rec.srvPct}%</span>
+          <span class="cmp-bar-counts">${rec.updatedSrv}/${rec.totalSrv}</span>
+        </div>`;
+    } else {
+      const epD   = d.epDelta  || 0;
+      const srvD  = d.srvDelta || 0;
+      html += `
+        <div class="cmp-bar-row">
+          <span class="cmp-bar-label">EP</span>
+          <div class="cmp-bar-track">
+            ${old ? `<div class="cmp-bar-fill cmp-bar-old" style="width:${Math.min(100,old.epPct)}%"></div>` : ''}
+            <div class="cmp-bar-fill" style="width:${epBar}%;background:${epColor}"></div>
+          </div>
+          <span class="cmp-bar-val" style="color:${epColor}">${rec.epPct}%</span>
+          <span class="cmp-bar-counts">${rec.updatedEP}/${rec.totalEP}</span>
+          ${old ? `<span class="cmp-inline-delta">${pctDelta(epD)}</span>` : ''}
+        </div>
+        <div class="cmp-bar-row">
+          <span class="cmp-bar-label">SRV</span>
+          <div class="cmp-bar-track">
+            ${old ? `<div class="cmp-bar-fill cmp-bar-old" style="width:${Math.min(100,old.srvPct)}%"></div>` : ''}
+            <div class="cmp-bar-fill" style="width:${srvBar}%;background:${srvColor}"></div>
+          </div>
+          <span class="cmp-bar-val" style="color:${srvColor}">${rec.srvPct}%</span>
+          <span class="cmp-bar-counts">${rec.updatedSrv}/${rec.totalSrv}</span>
+          ${old ? `<span class="cmp-inline-delta">${pctDelta(srvD)}</span>` : ''}
+        </div>`;
+      if (old) {
+        html += `
+          <div class="cmp-prev-row">
+            Previous: EP ${old.epPct}% (${old.updatedEP}/${old.totalEP}) &nbsp;·&nbsp;
+            SRV ${old.srvPct}% (${old.updatedSrv}/${old.totalSrv})
+          </div>`;
+      }
+    }
+
+    if (rec && rec.notes) {
+      html += `<div class="cmp-notes-row">📝 ${rec.notes}</div>`;
+    }
+
+    html += `</div>`; // end cmp-asset-card
+  });
+
+  html += `</div>`; // end cmp-asset-grid
+
+  container.innerHTML = html;
+}

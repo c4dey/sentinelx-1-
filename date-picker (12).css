@@ -1,0 +1,179 @@
+'use strict';
+
+// ── SentinelX API Client ──────────────────────────────────────
+// Auto-detects backend URL — works locally AND when deployed.
+// If the frontend is served by the same server (Railway/Render),
+// API calls go to the same origin. No config needed.
+
+const API_BASE = (() => {
+  // Explicit override (e.g. window.SX_API_BASE = 'https://...' in a config file)
+  if (window.SX_API_BASE) return window.SX_API_BASE;
+  // Same-origin: frontend served by Flask (deployed or local via python3 server.py)
+  if (window.location.port !== '5500' && window.location.port !== '3000') {
+    return window.location.origin + '/api';
+  }
+  // Dev mode: frontend opened directly, backend on localhost:5000
+  return 'http://localhost:5000/api';
+})();
+
+// ── Token storage ─────────────────────────────────────────────
+const SxAuth = {
+  getAccess()          { return localStorage.getItem('sx_access_token'); },
+  getRefresh()         { return localStorage.getItem('sx_refresh_token'); },
+  setTokens(a, r)      { localStorage.setItem('sx_access_token', a); localStorage.setItem('sx_refresh_token', r); },
+  clearTokens()        { localStorage.removeItem('sx_access_token'); localStorage.removeItem('sx_refresh_token'); localStorage.removeItem('sx_current_user'); },
+  getUser()            { try { return JSON.parse(localStorage.getItem('sx_current_user')); } catch { return null; } },
+  setUser(u)           { localStorage.setItem('sx_current_user', JSON.stringify(u)); },
+  isLoggedIn()         { return !!this.getAccess() && !!this.getUser(); },
+};
+
+// ── Core fetch wrapper ────────────────────────────────────────
+let _refreshPromise = null;
+
+async function sxFetch(path, options = {}) {
+  const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+  const token = SxAuth.getAccess();
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+
+  const res = await fetch(API_BASE + path, { ...options, headers });
+
+  // Token expired → try refresh once
+  if (res.status === 401) {
+    const body = await res.json().catch(() => ({}));
+    if (body.code === 'TOKEN_EXPIRED') {
+      if (!_refreshPromise) {
+        _refreshPromise = sxRefreshToken().finally(() => { _refreshPromise = null; });
+      }
+      const refreshed = await _refreshPromise;
+      if (refreshed) {
+        // retry with new token
+        headers['Authorization'] = 'Bearer ' + SxAuth.getAccess();
+        return fetch(API_BASE + path, { ...options, headers });
+      }
+    }
+    throw Object.assign(new Error(body.error || 'Unauthorized'), { status: 401, body });
+  }
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw Object.assign(new Error(body.error || `HTTP ${res.status}`), { status: res.status, body });
+  }
+
+  return res.json().catch(() => ({}));
+}
+
+async function sxRefreshToken() {
+  const rt = SxAuth.getRefresh();
+  if (!rt) { SxAuth.clearTokens(); window.location.reload(); return false; }
+  try {
+    const res = await fetch(API_BASE + '/auth/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: rt }),
+    });
+    if (!res.ok) throw new Error('refresh failed');
+    const data = await res.json();
+    SxAuth.setTokens(data.access_token, data.refresh_token);
+    SxAuth.setUser(data.user);
+    return true;
+  } catch {
+    SxAuth.clearTokens();
+    window.location.reload();
+    return false;
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+// AUTH API
+// ══════════════════════════════════════════════════════════════
+const SxAPI = {
+  async signIn(email, password) {
+    const data = await sxFetch('/auth/signin', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    });
+    SxAuth.setTokens(data.access_token, data.refresh_token);
+    SxAuth.setUser(data.user);
+    return data.user;
+  },
+
+  async signUp(first, last, email, password, role = 'Analyst') {
+    const data = await sxFetch('/auth/signup', {
+      method: 'POST',
+      body: JSON.stringify({ first, last, email, password, role }),
+    });
+    SxAuth.setTokens(data.access_token, data.refresh_token);
+    SxAuth.setUser(data.user);
+    return data.user;
+  },
+
+  async signOut() {
+    try {
+      await sxFetch('/auth/signout', {
+        method: 'POST',
+        body: JSON.stringify({ refresh_token: SxAuth.getRefresh() }),
+      });
+    } catch { /* ignore */ }
+    SxAuth.clearTokens();
+  },
+
+  async me() {
+    const data = await sxFetch('/auth/me');
+    SxAuth.setUser(data.user);
+    return data.user;
+  },
+
+  // ── Users ──
+  async getUsers()            { return (await sxFetch('/users')).users; },
+  async deleteUser(id)        { return sxFetch(`/users/${id}`, { method: 'DELETE' }); },
+  async updateRole(id, role)  { return sxFetch(`/users/${id}/role`, { method: 'PATCH', body: JSON.stringify({ role }) }); },
+  async changePassword(cur, nw) {
+    return sxFetch('/users/me/password', {
+      method: 'PATCH',
+      body: JSON.stringify({ current_password: cur, new_password: nw }),
+    });
+  },
+
+  // ── VM ──
+  async vmList(filters = {})  {
+    const params = new URLSearchParams(filters).toString();
+    return (await sxFetch('/vm' + (params ? '?' + params : ''))).records;
+  },
+  async vmCreate(record)      { return (await sxFetch('/vm', { method: 'POST', body: JSON.stringify(record) })).record; },
+  async vmUpdate(id, data)    { return (await sxFetch(`/vm/${id}`, { method: 'PUT', body: JSON.stringify(data) })).record; },
+  async vmDelete(id)          { return sxFetch(`/vm/${id}`, { method: 'DELETE' }); },
+  async vmBulk(records)       { return sxFetch('/vm/bulk', { method: 'POST', body: JSON.stringify({ records }) }); },
+
+  // ── ESC ──
+  async escList(filters = {}) {
+    const params = new URLSearchParams(filters).toString();
+    return (await sxFetch('/esc' + (params ? '?' + params : ''))).records;
+  },
+  async escCreate(record)     { return (await sxFetch('/esc', { method: 'POST', body: JSON.stringify(record) })).record; },
+  async escUpdate(id, data)   { return (await sxFetch(`/esc/${id}`, { method: 'PUT', body: JSON.stringify(data) })).record; },
+  async escDelete(id)         { return sxFetch(`/esc/${id}`, { method: 'DELETE' }); },
+  async escBulk(records)      { return sxFetch('/esc/bulk', { method: 'POST', body: JSON.stringify({ records }) }); },
+
+  // ── Compare helpers ──
+  async vmPeriods()       { return (await sxFetch('/vm/periods')).periods; },
+  async escPeriods()      { return (await sxFetch('/esc/periods')).periods; },
+
+  // ── Health ──
+  async health()              { return sxFetch('/health'); },
+  async isBackendUp() {
+    try { await this.health(); return true; } catch { return false; }
+  },
+};
+
+// ── Backend detection & mode banner ──────────────────────────
+window.SX_BACKEND_MODE = false;
+
+async function sxDetectBackend() {
+  window.SX_BACKEND_MODE = await SxAPI.isBackendUp();
+  if (!window.SX_BACKEND_MODE) {
+    console.warn('[SentinelX] Backend not reachable — running in localStorage mode');
+  } else {
+    console.log('[SentinelX] Backend connected at', API_BASE);
+  }
+  return window.SX_BACKEND_MODE;
+}

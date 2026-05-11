@@ -1,0 +1,154 @@
+'use strict';
+
+// ── Auth state ────────────────────────────────────────────────
+let currentUser = null;
+
+const ROLE_COLORS  = { Admin: '#ff6b6b',               Analyst: '#58a6ff',               Viewer: '#69db7c'               };
+const ROLE_BGS     = { Admin: 'rgba(255,107,107,0.15)', Analyst: 'rgba(88,166,255,0.15)', Viewer: 'rgba(105,219,124,0.15)' };
+const ROLE_BORDERS = { Admin: 'rgba(255,107,107,0.3)',  Analyst: 'rgba(88,166,255,0.3)',  Viewer: 'rgba(105,219,124,0.3)'  };
+
+function makeInitials(f,l) { return ((f||'?')[0]+((l||'')[0]||'')).toUpperCase(); }
+function makeColor(r)      { return ROLE_COLORS[r]  || '#8d96a0'; }
+function makeBg(r)         { return ROLE_BGS[r]     || 'rgba(141,150,160,0.15)'; }
+function makeBorder(r)     { return ROLE_BORDERS[r] || 'rgba(141,150,160,0.3)'; }
+
+// ── Offline fallback store ────────────────────────────────────
+let _offlineUsers = null;
+function getOfflineUsers() {
+  if (!_offlineUsers) {
+    _offlineUsers = JSON.parse(localStorage.getItem('sx_offline_users') || 'null') || [
+      { id:1, first:'Admin',    last:'User',    email:'admin@sentinelx.com',   password:'admin123',   role:'Admin',   initials:'AU', color:'#ff6b6b', bg:'rgba(255,107,107,0.15)' },
+      { id:2, first:'Security', last:'Analyst', email:'analyst@sentinelx.com', password:'analyst123', role:'Analyst', initials:'SA', color:'#58a6ff', bg:'rgba(88,166,255,0.15)'  },
+      { id:3, first:'Read',     last:'Viewer',  email:'viewer@sentinelx.com',  password:'viewer123',  role:'Viewer',  initials:'RV', color:'#69db7c', bg:'rgba(105,219,124,0.15)' },
+    ];
+  }
+  return _offlineUsers;
+}
+function saveOfflineUsers() { localStorage.setItem('sx_offline_users', JSON.stringify(_offlineUsers)); }
+
+// ── UI helpers ────────────────────────────────────────────────
+function toggleAuth(mode) {
+  document.getElementById('si-box').style.display  = mode === 'signin' ? '' : 'none';
+  document.getElementById('su-box').style.display  = mode === 'signup' ? '' : 'none';
+  document.getElementById('si-error').style.display = 'none';
+  document.getElementById('su-error').style.display = 'none';
+}
+function setAuthLoading(on) {
+  document.querySelectorAll('.auth-submit-btn').forEach(b => {
+    b.disabled = on;
+    if (on) { b.dataset.orig = b.textContent; b.textContent = 'Please wait…'; }
+    else if (b.dataset.orig) b.textContent = b.dataset.orig;
+  });
+}
+function showAuthError(id, msg) {
+  const el = document.getElementById(id);
+  if (el) { el.textContent = msg; el.style.display = 'block'; }
+}
+function unifiedQuickLogin(email, pass) {
+  document.getElementById('si-email').value = email;
+  document.getElementById('si-pass').value  = pass;
+  unifiedSignIn();
+}
+
+// ── Sign In ───────────────────────────────────────────────────
+async function unifiedSignIn() {
+  const email = document.getElementById('si-email').value.trim().toLowerCase();
+  const pass  = document.getElementById('si-pass').value;
+  if (!email || !pass) { showAuthError('si-error', 'Please enter email and password.'); return; }
+  setAuthLoading(true);
+  document.getElementById('si-error').style.display = 'none';
+  if (window.SX_BACKEND_MODE) {
+    try   { _onLoginSuccess(await SxAPI.signIn(email, pass)); }
+    catch (err) { showAuthError('si-error', err.message || 'Invalid email or password.'); }
+    finally { setAuthLoading(false); }
+  } else {
+    const u = getOfflineUsers().find(u => u.email.toLowerCase()===email && u.password===pass);
+    if (!u) { showAuthError('si-error','Invalid email or password.'); setAuthLoading(false); return; }
+    SxAuth.setUser(u); setAuthLoading(false); _onLoginSuccess(u);
+  }
+}
+
+// ── Sign Up ───────────────────────────────────────────────────
+async function unifiedSignUp() {
+  const first = document.getElementById('su-first').value.trim();
+  const last  = document.getElementById('su-last').value.trim();
+  const email = document.getElementById('su-email').value.trim().toLowerCase();
+  const pass  = document.getElementById('su-pass').value;
+  const role  = document.getElementById('su-role').value;
+  if (!first||!last||!email||!pass) { showAuthError('su-error','Please fill in all fields.'); return; }
+  if (pass.length < 6)              { showAuthError('su-error','Password must be at least 6 characters.'); return; }
+  setAuthLoading(true);
+  document.getElementById('su-error').style.display = 'none';
+  if (window.SX_BACKEND_MODE) {
+    try   { _onLoginSuccess(await SxAPI.signUp(first, last, email, pass, role)); }
+    catch (err) { showAuthError('su-error', err.message || 'Sign up failed.'); }
+    finally { setAuthLoading(false); }
+  } else {
+    const users = getOfflineUsers();
+    if (users.find(u => u.email.toLowerCase()===email)) {
+      showAuthError('su-error','Email already registered.'); setAuthLoading(false); return;
+    }
+    const nu = { id:Date.now(), first, last, email, password:pass, role,
+      initials:makeInitials(first,last), color:makeColor(role), bg:makeBg(role) };
+    users.push(nu); saveOfflineUsers();
+    SxAuth.setUser(nu); setAuthLoading(false); _onLoginSuccess(nu);
+  }
+}
+
+// ── Sign Out ──────────────────────────────────────────────────
+async function unifiedSignOut() {
+  if (window.SX_BACKEND_MODE) { try { await SxAPI.signOut(); } catch {} }
+  currentUser = null;
+  ['app-switcher-bar','app-vm','app-esc','vm-main-app','esc-main-app'].forEach(id => {
+    document.getElementById(id).style.display = 'none';
+  });
+  const picker = document.getElementById('tool-picker');
+  picker.style.display = 'none'; picker.classList.remove('tp-out');
+  document.getElementById('auth-screen').style.display = '';
+  document.getElementById('si-email').value = '';
+  document.getElementById('si-pass').value  = '';
+  document.getElementById('si-error').style.display = 'none';
+  toggleAuth('signin');
+}
+
+// ── Session restore ───────────────────────────────────────────
+async function sxTryRestoreSession() {
+  const backendUp = await sxDetectBackend();
+  if (backendUp && SxAuth.getAccess()) {
+    try {
+      const user = await SxAPI.me();
+      _onLoginSuccess(user); return;
+    } catch (err) {
+      if (err.status === 401) {
+        const ok = await sxRefreshToken();
+        if (ok) { try { _onLoginSuccess(await SxAPI.me()); return; } catch {} }
+      }
+      SxAuth.clearTokens();
+    }
+  } else if (!backendUp) {
+    const saved = SxAuth.getUser();
+    if (saved) { currentUser = saved; _onLoginSuccess(saved); return; }
+  }
+  document.getElementById('auth-screen').style.display = '';
+}
+
+// ── Post-login ────────────────────────────────────────────────
+function _onLoginSuccess(user) {
+  if (!user.color)    user.color    = makeColor(user.role);
+  if (!user.bg)       user.bg       = makeBg(user.role);
+  if (!user.initials) user.initials = makeInitials(user.first, user.last);
+  currentUser = user;
+  SxAuth.setUser(user);
+  document.getElementById('auth-screen').style.display = 'none';
+  const badge = document.getElementById('sx-mode-badge');
+  if (badge) {
+    badge.textContent = window.SX_BACKEND_MODE ? '🟢 Backend' : '🟡 Offline';
+    badge.title = window.SX_BACKEND_MODE
+      ? 'Connected — data saved to server'
+      : 'Offline mode — data in browser only. Start server.py to enable backend.';
+    badge.style.display = '';
+  }
+  showToolPicker();
+}
+
+document.addEventListener('DOMContentLoaded', () => { sxTryRestoreSession(); });
